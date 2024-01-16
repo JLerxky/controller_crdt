@@ -17,11 +17,16 @@ use std::{
     cmp::{Eq, PartialEq},
     collections::HashSet,
     hash::{Hash, Hasher},
+    sync::Arc,
 };
 
 use cita_cloud_proto::blockchain::{raw_transaction::Tx, RawTransaction};
+use indexmap::IndexSet;
+use tokio::sync::RwLock;
 
-use crate::util::get_tx_quota;
+use crate::{grpc_client::storage::reload_transactions_pool, util::get_tx_quota};
+
+use super::auditor::Auditor;
 
 // wrapper type for Hash
 #[derive(Clone)]
@@ -56,29 +61,80 @@ fn get_raw_tx_hash(raw_tx: &RawTransaction) -> &[u8] {
 }
 
 pub struct Pool {
-    txns: HashSet<Txn>,
+    txns: IndexSet<Txn>,
     pool_quota: u64,
     block_limit: u64,
     quota_limit: u64,
+    warn_quota: u64,
+    busy_quota: u64,
+    in_busy: bool,
+}
+
+#[derive(Debug)]
+pub enum PoolError {
+    DupTransaction,
+    TooManyRequests,
 }
 
 impl Pool {
     pub fn new(block_limit: u64, quota_limit: u64) -> Self {
         Pool {
-            txns: HashSet::new(),
+            txns: IndexSet::new(),
             pool_quota: 0,
             block_limit,
             quota_limit,
+            warn_quota: quota_limit * 30,
+            busy_quota: quota_limit * 50,
+            in_busy: false,
         }
     }
 
-    pub fn insert(&mut self, raw_tx: RawTransaction) -> bool {
-        let tx_quota = get_tx_quota(&raw_tx).unwrap();
-        let ret = self.txns.insert(Txn(raw_tx));
-        if ret {
+    pub async fn init(&mut self, auditor: Arc<RwLock<Auditor>>) {
+        let mut txns = reload_transactions_pool()
+            .await
+            .map_or_else(|_| vec![], |txns| txns.body);
+        info!("pool init start: txns({})", txns.len());
+        {
+            let auditor = auditor.read().await;
+            let history_hashes_set: HashSet<_> = auditor
+                .history_hashes
+                .iter()
+                .flat_map(|(_, hashes)| hashes)
+                .collect();
+
+            txns.retain(|txn| !history_hashes_set.contains(&get_raw_tx_hash(txn).to_vec()));
+        }
+        for raw_tx in txns {
+            let tx_quota = get_tx_quota(&raw_tx).unwrap();
+            self.txns.insert(Txn(raw_tx));
             self.pool_quota += tx_quota;
         }
-        ret
+
+        info!(
+            "pool init finished: txns({}), pool_quota({})",
+            self.txns.len(),
+            self.pool_quota
+        );
+    }
+
+    pub fn insert(&mut self, raw_tx: RawTransaction) -> Result<(), PoolError> {
+        if self.in_busy {
+            Err(PoolError::TooManyRequests)
+        } else {
+            let tx_quota = get_tx_quota(&raw_tx).unwrap();
+            if self.pool_quota + tx_quota > self.busy_quota {
+                self.in_busy = true;
+                Err(PoolError::TooManyRequests)
+            } else {
+                let ret = self.txns.insert(Txn(raw_tx));
+                if ret {
+                    self.pool_quota += tx_quota;
+                    Ok(())
+                } else {
+                    Err(PoolError::DupTransaction)
+                }
+            }
+        }
     }
 
     pub fn remove(&mut self, tx_hash_list: &[Vec<u8>]) {
@@ -92,12 +148,24 @@ impl Pool {
             }
             self.txns.remove(tx_hash.as_slice());
         }
+        if self.pool_quota < self.warn_quota {
+            self.in_busy = false;
+        }
     }
 
     pub fn package(&mut self, height: u64) -> (Vec<Vec<u8>>, u64) {
         let block_limit = self.block_limit;
-        self.txns
-            .retain(|txn| tx_is_valid(&txn.0, height, block_limit));
+        self.txns.retain(|txn| {
+            let tx_is_valid = tx_is_valid(&txn.0, height, block_limit);
+            if !tx_is_valid {
+                let tx_quota = get_tx_quota(&txn.0).unwrap();
+                self.pool_quota -= tx_quota;
+            }
+            tx_is_valid
+        });
+        if self.pool_quota < self.warn_quota {
+            self.in_busy = false;
+        }
         let mut quota_limit = self.quota_limit;
         let mut pack_tx = vec![];
         for txn in self.txns.iter().cloned() {

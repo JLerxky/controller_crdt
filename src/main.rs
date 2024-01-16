@@ -145,12 +145,7 @@ async fn run(opts: RunOpts) -> Result<(), StatusCodeEnum> {
     loop {
         server_retry_interval.tick().await;
         {
-            match load_data_maybe_empty(
-                i32::from(Regions::Global) as u32,
-                0u64.to_be_bytes().to_vec(),
-            )
-            .await
-            {
+            match load_data_maybe_empty(Regions::Global as u32, 0u64.to_be_bytes().to_vec()).await {
                 Ok(current_block_number_bytes) => {
                     info!("storage service ready, get current height success");
                     if current_block_number_bytes.is_empty() {
@@ -162,11 +157,10 @@ async fn run(opts: RunOpts) -> Result<(), StatusCodeEnum> {
                         current_block_number = u64_decode(current_block_number_bytes);
                         current_block_hash = load_data(
                             storage_client(),
-                            i32::from(Regions::Global) as u32,
+                            Regions::Global as u32,
                             1u64.to_be_bytes().to_vec(),
                         )
-                        .await
-                        .unwrap();
+                        .await?;
                     }
                     break;
                 }
@@ -209,12 +203,13 @@ async fn run(opts: RunOpts) -> Result<(), StatusCodeEnum> {
             .await,
     ));
 
-    tokio::spawn(grpc_serve(
+    let mut grpc_join_handle = tokio::spawn(grpc_serve(
         controller.clone(),
         controller_state_machine.clone(),
         config.clone(),
         rx_signal.clone(),
     ));
+    let mut restart_num = 0;
 
     let mut reconnect_interval =
         time::interval(Duration::from_secs(config.origin_node_reconnect_interval));
@@ -229,15 +224,24 @@ async fn run(opts: RunOpts) -> Result<(), StatusCodeEnum> {
             _ = reconnect_interval.tick() => {
                 event_sender
                     .send(Event::BroadcastCSI)
-                    .unwrap();
+                    .map_err(|e| {
+                        warn!("send broadcast csi event failed: {}", e);
+                        StatusCodeEnum::FatalError
+                    })?;
                 event_sender
                     .send(Event::RecordAllNode)
-                    .unwrap();
+                    .map_err(|e| {
+                        warn!("send record all node event failed: {}", e);
+                        StatusCodeEnum::FatalError
+                    })?;
             },
             _ = inner_health_check_interval.tick() => {
                 event_sender
                     .send(Event::InnerHealthCheck)
-                    .unwrap();
+                    .map_err(|e| {
+                        warn!("send inner health check event failed: {}", e);
+                        StatusCodeEnum::FatalError
+                    })?;
             },
             _ = forward_interval.tick() => {
                 controller
@@ -253,6 +257,25 @@ async fn run(opts: RunOpts) -> Result<(), StatusCodeEnum> {
             },
             else => {
                 debug!("controller task exit!");
+                break;
+            }
+        }
+        if grpc_join_handle.is_finished() {
+            if restart_num < 10 {
+                info!(
+                    "controller grpc server has exited, try to start again({})...",
+                    restart_num
+                );
+                tokio::time::sleep(Duration::from_secs(config.server_retry_interval)).await;
+                grpc_join_handle = tokio::spawn(grpc_serve(
+                    controller.clone(),
+                    controller_state_machine.clone(),
+                    config.clone(),
+                    rx_signal.clone(),
+                ));
+                restart_num += 1;
+            } else {
+                info!("controller grpc server has exited, and restart failed, exit!",);
                 break;
             }
         }
